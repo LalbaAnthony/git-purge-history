@@ -48,7 +48,15 @@ git-purge-history.sh rewrite \
   --path uploads --path vmlinuz
 ```
 
-Les chemins sont relatifs à la racine du dépôt : `uploads` supprime `uploads/` à la racine, pas `src/uploads/`, `uploads2/` ni `uploads.txt`. Une liste peut être passée avec `--paths-file` (un chemin par ligne, `#` pour les commentaires). Un chemin introuvable dans l'historique arrête tout (faute de frappe, casse).
+Les chemins sont relatifs à la racine du dépôt : `uploads` supprime `uploads/` à la racine, pas `src/uploads/`, `uploads2/` ni `uploads.txt`. Une liste peut être passée avec `--paths-file` (un chemin par ligne, `#` pour les commentaires). Un chemin introuvable dans l'historique arrête tout (faute de frappe, casse) ; tous les chemins introuvables sont listés d'un coup.
+
+Pour purger un dossier en gardant certains de ses fichiers (par exemple les `.gitkeep` qui créent son arborescence), passer avec `--paths-file` la liste de tous les chemins qu'il a contenus dans l'historique, sauf ceux à garder. À générer dans un clone à jour, ou dans le `work.git` d'une réécriture déjà poussée :
+
+```bash
+for c in $(git rev-list --all --full-history -- files); do git ls-tree -r -z --name-only "$c" -- files; done | tr '\0' '\n' | sort -u | grep -v '/\.gitkeep$' > files-sans-gitkeep.txt
+```
+
+La vérification prouve ensuite que les fichiers gardés n'ont pas changé. Le contrôle des chemins parcourt l'historique une fois par chemin, avant et après la réécriture : compter quelques minutes par millier de chemins.
 
 Contenu du `--workdir` :
 
@@ -94,6 +102,8 @@ git-purge-history.sh push --workdir ../purge-projet
    ```
 
    Le script refuse s'il y a des modifications locales sur des fichiers suivis hors chemins purgés, ou si le serveur n'a pas encore été réécrit. Sinon, il retire les chemins de l'index sans toucher aux fichiers sur disque, puis fait un `fetch` et un `reset --hard` sur l'upstream réécrit. Il contrôle ensuite que le nombre de fichiers sur disque n'a pas baissé. `--gc` libère la place de l'ancien historique.
+
+   `update-checkout` n'est pas prévu pour une longue liste de chemins : au-delà de quelques centaines, la ligne de commande dépasse la limite de Windows et le contrôle des refs locales devient très lent. Dans ce cas, mettre de côté les fichiers purgés, recloner, puis les remettre en place.
 5. Garder `backup.git` quelques semaines, puis supprimer le workdir.
 
 ## Effets de bord à connaître

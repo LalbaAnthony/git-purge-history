@@ -79,6 +79,12 @@ repo_kib() {
 
 count_lines() { awk 'END { print NR }' "$1"; }
 
+# Prints stdin indented, at most 10 lines, then the total when there were more. Path lists can
+# hold thousands of entries: per-path output must go through this.
+print_some() {
+  awk 'NR <= 10 { print "  " $0 } END { if (NR > 10) print "  ... (" NR " in total)" }'
+}
+
 require_git_version() {
   local v major minor
   v="$(git --version | awk '{ print $3 }')"
@@ -103,6 +109,11 @@ require_filter_repo() {
 # root, forward slashes, no leading "./" or "/", no trailing "/".
 normalize_path() {
   local p="$1"
+  # Paths reach git-filter-repo through a line-based file (see cmd_rewrite).
+  case "$p" in
+    *$'\n'* | *$'\r'*) die "invalid path: line breaks are not supported" ;;
+    *'==>'*) die "invalid path '$1': git-filter-repo would read '==>' as a rename" ;;
+  esac
   p="${p//\\//}"
   while [[ "$p" == ./* ]]; do p="${p#./}"; done
   while [[ "$p" == /* ]]; do p="${p#/}"; done
@@ -200,19 +211,23 @@ report_largest_blobs() {
         NR <= top { printf "%10.1f MiB  %s%s\n", $2 / 1048576, $3, ($3 in inhead ? "" : "  [not in HEAD]") }'
 }
 
-# Warns when a purged path is not ignored by the root .gitignore of the default branch of REPO:
-# otherwise it will be committed again sooner or later.
+# Warns when purged paths are not ignored by the root .gitignore of the default branch of REPO:
+# otherwise they will be committed again sooner or later.
 warn_if_not_ignored() {
-  local repo="$1" probe="$TMP_ROOT/ignore-probe" p
+  local repo="$1" probe="$TMP_ROOT/ignore-probe" p not_ignored=()
   rm -rf "$probe"
   git init -q "$probe"
   git -C "$probe" config core.excludesFile .git/info/no-global-excludes
   git -C "$repo" show HEAD:.gitignore > "$probe/.gitignore" 2>/dev/null || : > "$probe/.gitignore"
   for p in "${PATHS[@]}"; do
     if ! git -C "$probe" check-ignore -q --no-index -- "$p" && ! git -C "$probe" check-ignore -q --no-index -- "$p/probe"; then
-      warn "'$p' is not ignored by the root .gitignore of the default branch: add it, or it will be committed again."
+      not_ignored+=("$p")
     fi
   done
+  if (( ${#not_ignored[@]} > 0 )); then
+    warn "${#not_ignored[@]} purged path(s) not ignored by the root .gitignore of the default branch: add them, or they will be committed again."
+    printf '%s\n' "${not_ignored[@]}" | print_some >&2
+  fi
 }
 
 load_workdir() {
@@ -322,18 +337,27 @@ cmd_rewrite() {
   info "$(count_lines "$WD/original-refs.txt") branch(es)/tag(s) to rewrite."
 
   title "3/5 Checking the paths to purge"
-  local p hit
+  info "Looking for ${#PATHS[@]} path(s) in the history (one history walk per path)..."
+  local p hit missing=()
   for p in "${PATHS[@]}"; do
     hit="$(first_commit_with_path "$WORK" --all "$p")"
-    [[ -n "$hit" ]] || die "'$p' is not in the history of any branch or tag (typo? case? paths are relative to the repository root)"
-    info "found in history: $p"
+    if [[ -z "$hit" ]]; then missing+=("$p"); fi
   done
+  if (( ${#missing[@]} > 0 )); then
+    printf '%s\n' "${missing[@]}" | print_some >&2
+    die "${#missing[@]} path(s) above are not in the history of any branch or tag (typo? case? paths are relative to the repository root)"
+  fi
+  info "ok   all ${#PATHS[@]} path(s) found in history:"
+  printf '%s\n' "${PATHS[@]}" | print_some
   warn_if_not_ignored "$WORK"
 
   title "4/5 Rewriting history with git-filter-repo"
-  local fr_args=()
-  for p in "${PATHS[@]}"; do fr_args+=(--path "$p"); done
-  git -C "$WORK" filter-repo --invert-paths "${fr_args[@]}" 2>&1 | tee "$WD/filter-repo.log"
+  # The paths go through a file: as --path arguments, a long list exceeds the Windows command-line
+  # limit (32767 characters). The "literal:" prefix keeps a path that starts with "glob:", "regex:"
+  # or "#" literal; normalize_path rejects the rename marker "==>" and line breaks.
+  local fr_paths="$TMP_ROOT/filter-repo-paths.txt"
+  printf 'literal:%s\n' "${PATHS[@]}" > "$fr_paths"
+  git -C "$WORK" filter-repo --invert-paths --paths-from-file "$fr_paths" 2>&1 | tee "$WD/filter-repo.log"
 
   title "5/5 Verification"
   verify_workdir
@@ -358,15 +382,18 @@ verify_workdir() {
   rm -f "$WD/verified.ok"
 
   info "Purged paths absent from every branch and tag:"
+  local left=()
   for p in "${PATHS[@]}"; do
     hit="$(first_commit_with_path "$WORK" --all "$p")"
-    if [[ -n "$hit" ]]; then
-      warn "  FAIL $p is still present (commit $hit)"
-      failures=$((failures + 1))
-    else
-      info "  ok   $p"
-    fi
+    if [[ -n "$hit" ]]; then left+=("$p (commit $hit)"); fi
   done
+  if (( ${#left[@]} > 0 )); then
+    warn "  FAIL ${#left[@]} purged path(s) still present:"
+    printf '%s\n' "${left[@]}" | print_some >&2
+    failures=$((failures + ${#left[@]}))
+  else
+    info "  ok   none of the ${#PATHS[@]} path(s) is left"
+  fi
 
   info "Every branch and tag has the same files as before, minus the purged paths:"
   while read -r old ref; do

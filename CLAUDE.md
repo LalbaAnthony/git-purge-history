@@ -16,11 +16,9 @@ KEEP_TMP=1 ./test.sh       # keep the sandbox directory for inspection
 bash -n git-purge-history.sh test.sh   # syntax check (no linter is configured)
 ```
 
-No single test can be run on its own. `test.sh` is one sequential scenario, and later sections depend on the state left by earlier ones (`WD1` is rewritten and then refused at push because of a racing commit, `WD2` is pushed, then the prod copy is updated). To add a test, insert it at the point in the sequence where its preconditions hold.
+No single test can be run on its own. `test.sh` is one sequential scenario, and later sections depend on the state left by earlier ones (`WD1` is rewritten and then refused at push because of a racing commit, `WD2` is pushed, then the prod copy is updated). To add a test, insert it at the point in the sequence where its preconditions hold. The last section (long path list) is independent: it has its own remote.
 
 Install git-filter-repo with `pip install git-filter-repo` (Windows: `py -m pip install --user git-filter-repo`), and make sure `git filter-repo --version` works.
-
-Status as of 2026-11-18: the suite was written but has never been run. The first run may show bugs in either file.
 
 ## Architecture
 
@@ -42,7 +40,7 @@ Status as of 2026-11-18: the suite was written but has never been run. The first
 
 A purged path P is root-anchored: it matches the path P itself or anything under `P/`, never `P2/` nor `src/P`. Three places implement this, and they must agree:
 
-1. git-filter-repo `--invert-paths --path P`.
+1. git-filter-repo `--invert-paths --paths-from-file`, with one `literal:P` line per path. The paths go through a file because a long list passed as `--path` arguments exceeds the Windows command-line limit (32767 characters). For the same reason, `normalize_path` rejects line breaks and `==>`, which git-filter-repo reads as a rename.
 2. `filter_out_paths` (awk). Verification uses it to compute "original tree minus purged paths".
 3. `first_commit_with_path`: `git --literal-pathspecs log --full-history -- P`. It is used for the "path exists" check before rewriting, the "path gone" check after, the "upstream rewritten?" check in `update-checkout` and stale-ref detection.
 
@@ -73,12 +71,15 @@ This subcommand updates a deployed copy, such as prod. Its steps must keep this 
 5. Run `rm -r --cached` on the purged paths, then `reset --hard`. Files that are no longer in the index are left alone.
 6. Count again. If the count dropped, fail loudly.
 
+Known limitation, out of scope so far: `update-checkout` does not scale to long path lists. Step 5 passes the paths to `git rm` and `git status` as arguments (Windows command-line limit), and the stale-ref scan walks the history once per path and per ref. `rewrite`, `verify` and `push` do scale.
+
 ## Shell conventions in this codebase
 
 - The script runs with `set -euo pipefail` and `LC_ALL=C`. Under these settings:
   - Never pipe into `head`: it causes SIGPIPE failures under pipefail. Use `awk 'NR <= n'` instead.
   - Wrap `diff`, `grep -c` and similar commands with `|| true` wherever a non-zero exit is expected.
   - Use `x=$((x + 1))` rather than `((x++))`.
+- Path lists can hold thousands of entries, for example a directory purged except its `.gitkeep` files, listed path by path. Never pass them to a command as arguments, and send any per-path output through `print_some`.
 - `die` inside `$(...)` only exits the subshell. Propagate the failure explicitly with `p="$(normalize_path ...)" || exit 1`, as `add_path` does.
 - Read git path listings with `-z | tr '\0' '\n'`, to avoid git's quoting of special characters.
 - The target is bash >= 4 on Linux and on Windows Git Bash; macOS's bash 3.2 is not supported. On Git Bash, `git.exe` is a native binary and MSYS converts path arguments for it, so do not set `MSYS_NO_PATHCONV`. A `file://` URL needs the Windows form of the path (`pwd -W`; see `file_url` in `test.sh`).
@@ -86,6 +87,6 @@ This subcommand updates a deployed copy, such as prod. Its steps must keep this 
 ## Test harness (`test.sh`)
 
 - **Isolation**: git is cut off from the user's configuration (`GIT_CONFIG_GLOBAL` points to a sandbox file, `GIT_CONFIG_NOSYSTEM=1`). Remotes are bare repositories served over `file://`, so the suite makes no network access.
-- **Fixture**: it covers every edge case the checks rely on: paths under `uploads/`, `vmlinuz`, look-alike paths that must survive (`uploads2/`, `uploads.txt`, `dir with space/uploads/`), a non-ASCII filename, an annotated tag, a lightweight tag, a merge, `refs/notes`, a commit that only touches purged paths, a prod clone with a modified and a new upload, a prod clone with an uncommitted code change, and a pre-rewrite clone used to re-push the old history.
+- **Fixture**: it covers every edge case the checks rely on: paths under `uploads/`, `vmlinuz`, look-alike paths that must survive (`uploads2/`, `uploads.txt`, `dir with space/uploads/`), a non-ASCII filename, an annotated tag, a lightweight tag, a merge, `refs/notes`, a commit that only touches purged paths, a prod clone with a modified and a new upload, a prod clone with an uncommitted code change, and a pre-rewrite clone used to re-push the old history. A second, independent remote holds a directory purged except its `.gitkeep` files through a list of 401 paths of about 100 characters, longer than the Windows command-line limit if passed as arguments.
 - **Running the tool**: `run_tool` runs the script with stdin from `/dev/null`, so `push` without `--yes` exercises the non-terminal refusal.
 - **Negative tests** assert both the non-zero exit and the error message, and, where relevant, that nothing changed (remote SHA, prod index).

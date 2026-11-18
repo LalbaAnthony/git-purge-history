@@ -72,6 +72,7 @@ paths_in_history() {
 }
 has_history_path() { local p; p="$(paths_in_history "$1")" || return 1; grep -qx -- "$2" <<< "$p"; }
 no_history_path_prefix() { local p; p="$(paths_in_history "$1")" || return 1; ! grep -q -- "^$2" <<< "$p"; }
+no_history_path_matching() { local p; p="$(paths_in_history "$1")" || return 1; ! grep -q -- "$2" <<< "$p"; }
 commit_subject_absent() { local s; s="$(git -C "$1" log --all --format=%s)" || return 1; ! grep -qx -- "$2" <<< "$s"; }
 ref_count_is() { local r; r="$(git -C "$1" for-each-ref refs/heads refs/tags)" || return 1; [[ "$(grep -c . <<< "$r")" -eq "$2" ]]; }
 pack_kib() { git -C "$1" count-objects -v | awk '$1 == "size-pack:" { print $2 }'; }
@@ -160,15 +161,21 @@ check "analyze flags vmlinuz as absent from HEAD" contains "$SANDBOX/analyze.log
 
 # ---------------------------------------------------------------------------------------------
 echo "# rewrite: argument and path validation"
-if run_tool "$SANDBOX/typo.log" rewrite --url "$URL" --workdir "$SANDBOX/wd-typo" --path uplods; then
-  ko "rewrite rejects a path absent from history"
+if run_tool "$SANDBOX/typo.log" rewrite --url "$URL" --workdir "$SANDBOX/wd-typo" --path uplods --path uploads --path vmlinux; then
+  ko "rewrite rejects paths absent from history"
 else
-  check "rewrite rejects a path absent from history" contains "$SANDBOX/typo.log" "is not in the history"
+  check "rewrite rejects paths absent from history" contains "$SANDBOX/typo.log" "2 path(s) above are not in the history"
+  check "rewrite names every missing path at once" bash -c "grep -qx '  uplods' '$SANDBOX/typo.log' && grep -qx '  vmlinux' '$SANDBOX/typo.log'"
 fi
 if run_tool "$SANDBOX/badpath.log" rewrite --url "$URL" --workdir "$SANDBOX/wd-bad" --path ../etc; then
   ko "rewrite rejects '..' in paths"
 else
   ok "rewrite rejects '..' in paths"
+fi
+if run_tool "$SANDBOX/arrow.log" rewrite --url "$URL" --workdir "$SANDBOX/wd-arrow" --path 'a==>b'; then
+  ko "rewrite rejects '==>' in paths (git-filter-repo rename marker)"
+else
+  check "rewrite rejects '==>' in paths (git-filter-repo rename marker)" contains "$SANDBOX/arrow.log" "read '==>' as a rename"
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -300,6 +307,42 @@ check "prod tag v1 updated to the rewritten tag" same_rev "$PROD" v1 "$REMOTE" v
 check "prod reports no stale ref" not_contains "$SANDBOX/upd.log" "still point to the old history"
 # Every purged blob in the fixture is >= 150000 bytes, every kept blob is smaller.
 check "prod object store has no purged blob left after --gc" no_blob_at_least "$PROD" 150000
+
+# ---------------------------------------------------------------------------------------------
+echo "# rewrite with a long path list: a directory purged except its .gitkeep files"
+# 401 paths of about 100 characters each: passed as command-line arguments, they would exceed the
+# Windows limit of 32767 characters. Independent of the scenario above (its own remote).
+MANY_REMOTE="$SANDBOX/many-remote.git"
+MANY_DEV="$SANDBOX/many-dev"
+git init -q --bare "$MANY_REMOTE"
+MANY_URL="$(file_url "$MANY_REMOTE")"
+git clone -q "$MANY_URL" "$MANY_DEV" 2>/dev/null
+printf -v LONG_NAME '%*s' 90 ''
+LONG_NAME="${LONG_NAME// /x}"
+(
+  cd "$MANY_DEV"
+  mkdir -p files/sub
+  : > files/.gitkeep
+  : > files/sub/.gitkeep
+  echo "<?php echo 1;" > app.php
+  for ((i = 1; i <= 400; i++)); do echo "$i" > "files/$i-$LONG_NAME.pdf"; done
+  echo "nested" > "files/sub/nested-$LONG_NAME.pdf"
+  git add -A && git commit -qm "drop zone committed by mistake"
+  git push -q origin master 2>/dev/null
+)
+git -C "$MANY_DEV" ls-tree -r -z --name-only HEAD -- files | tr '\0' '\n' | grep -v '/\.gitkeep$' > "$SANDBOX/many-paths.txt"
+MANY_WD="$SANDBOX/wd-many"
+if run_tool "$SANDBOX/rewrite-many.log" rewrite --url "$MANY_URL" --workdir "$MANY_WD" --paths-file "$SANDBOX/many-paths.txt"; then
+  ok "rewrite succeeds with 401 long paths"
+else
+  ko "rewrite succeeds with 401 long paths"; cat "$SANDBOX/rewrite-many.log"
+fi
+check "no purged .pdf left in rewritten history" no_history_path_matching "$MANY_WD/work.git" '\.pdf$'
+check "files/.gitkeep kept" git -C "$MANY_WD/work.git" cat-file -e "refs/heads/master:files/.gitkeep"
+check "files/sub/.gitkeep kept" git -C "$MANY_WD/work.git" cat-file -e "refs/heads/master:files/sub/.gitkeep"
+check "app.php kept" git -C "$MANY_WD/work.git" cat-file -e "refs/heads/master:app.php"
+check "not-ignored warning is a single summary" contains "$SANDBOX/rewrite-many.log" "401 purged path(s) not ignored"
+check "long path lists are truncated in the output" contains "$SANDBOX/rewrite-many.log" "(401 in total)"
 
 summary
 FINISHED=1
