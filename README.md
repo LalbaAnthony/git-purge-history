@@ -15,7 +15,7 @@ Les commandes sont séparées pour qu'il y ait toujours un point de contrôle hu
 ## Prérequis
 
 - bash ≥ 4 (sous Windows : **Git Bash**), Git ≥ 2.36.
-- git-filter-repo : `pip install git-filter-repo` (Windows : `py -m pip install --user git-filter-repo`). Si pip signale que le dossier `Scripts` n'est pas dans le `PATH`, l'y ajouter. Vérifier avec `git filter-repo --version`.
+- git-filter-repo : `pip install git-filter-repo` (Windows : `py -m pip install --user git-filter-repo`). Vérifier avec `git filter-repo --version`. Si git ne le trouve pas, ajouter au `PATH` le dossier des scripts Python utilisateur, que donne `py -c "import sysconfig; print(sysconfig.get_path('scripts', 'nt_user'))"` (par exemple `C:\Users\<user>\AppData\Roaming\Python\Python314\Scripts`). Dans Git Bash, ajouter à `~/.bashrc` : `export PATH="$PATH:/c/Users/<user>/AppData/Roaming/Python/Python314/Scripts"`.
 - De la place disque pour un clone miroir complet du dépôt.
 - Lancer les tests une fois sur la machine : `./test.sh` (dépôt synthétique dans un dossier temporaire, aucun accès réseau).
 

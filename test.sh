@@ -4,17 +4,35 @@
 # Requirements: the same as the script (git >= 2.36, git-filter-repo in PATH).
 # Usage: ./test.sh            (KEEP_TMP=1 ./test.sh keeps the sandbox for inspection)
 
-set -euo pipefail
+set -eEuo pipefail
 export LC_ALL=C
+
+if ! git filter-repo --version >/dev/null 2>&1; then
+  echo "git-filter-repo is not reachable ('git filter-repo --version' fails): add its directory to PATH first." >&2
+  exit 1
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/git-purge-history.sh"
 SANDBOX="$(mktemp -d)"
-if [[ "${KEEP_TMP:-0}" == "1" ]]; then
-  trap 'echo "sandbox kept: $SANDBOX"' EXIT
-else
-  trap 'rm -rf "$SANDBOX"' EXIT
-fi
+
+# A failure outside any assertion aborts the run (set -e): remember where, report it on exit.
+# Failures inside assertions run in a condition context and do not trigger the ERR trap.
+ERR_AT=""
+FINISHED=0
+trap 'ERR_AT="${ERR_AT:-line $LINENO: $BASH_COMMAND}"' ERR
+on_exit() {
+  local status=$?
+  if (( status != 0 && FINISHED == 0 )); then
+    echo "ABORTED (exit $status) at ${ERR_AT:-an unknown location}" >&2
+  fi
+  if [[ "${KEEP_TMP:-0}" == "1" ]]; then
+    echo "sandbox kept: $SANDBOX"
+  else
+    rm -rf "$SANDBOX"
+  fi
+}
+trap on_exit EXIT
 
 # Isolate git from the user's configuration.
 printf '[init]\n\tdefaultBranch = master\n[user]\n\tname = test\n\temail = test@example.invalid\n[advice]\n\tdetachedHead = false\n' > "$SANDBOX/gitconfig"
@@ -28,13 +46,45 @@ FAIL=0
 ok() { PASS=$((PASS + 1)); printf 'ok     - %s\n' "$1"; }
 ko() { FAIL=$((FAIL + 1)); printf 'NOT OK - %s\n' "$1"; }
 check() { local desc="$1"; shift; if "$@"; then ok "$desc"; else ko "$desc"; fi; }
-run() { local log="$1"; shift; "$@" > "$log" 2>&1; }
+summary() { echo; printf '%d passed, %d failed\n' "$PASS" "$FAIL"; }
 run_tool() { local log="$1"; shift; bash "$SCRIPT" "$@" < /dev/null > "$log" 2>&1; }
-contains() { grep -q -- "$2" "$1"; }
-paths_in_history() { git -C "$1" rev-list --objects --all | awk '{ $1 = ""; print substr($0, 2) }'; }
-has_history_path() { paths_in_history "$1" | grep -qx -- "$2"; }
-no_history_path_prefix() { ! paths_in_history "$1" | grep -q -- "^$2"; }
+# Runs a step that later tests depend on: stop everything if it fails.
+setup_step() {
+  local log="$1"; shift
+  if ! run_tool "$log" "$@"; then
+    echo "SETUP FAILED: $*" >&2
+    cat "$log" >&2
+    summary
+    FINISHED=1
+    exit 1
+  fi
+}
 random_file() { mkdir -p "$(dirname "$1")"; head -c "$2" /dev/urandom > "$1"; }
+
+# Assertion helpers. Each one fails when its log or repository cannot be read, so that a missing
+# workdir never makes a negative assertion ("X is absent") pass.
+contains() { [[ -f "$1" ]] && grep -q -- "$2" "$1"; }
+not_contains() { [[ -f "$1" ]] && ! grep -q -- "$2" "$1"; }
+paths_in_history() {
+  local objects
+  objects="$(git -C "$1" rev-list --objects --all)" || return 1
+  awk '{ $1 = ""; print substr($0, 2) }' <<< "$objects"
+}
+has_history_path() { local p; p="$(paths_in_history "$1")" || return 1; grep -qx -- "$2" <<< "$p"; }
+no_history_path_prefix() { local p; p="$(paths_in_history "$1")" || return 1; ! grep -q -- "^$2" <<< "$p"; }
+commit_subject_absent() { local s; s="$(git -C "$1" log --all --format=%s)" || return 1; ! grep -qx -- "$2" <<< "$s"; }
+ref_count_is() { local r; r="$(git -C "$1" for-each-ref refs/heads refs/tags)" || return 1; [[ "$(grep -c . <<< "$r")" -eq "$2" ]]; }
+pack_kib() { git -C "$1" count-objects -v | awk '$1 == "size-pack:" { print $2 }'; }
+at_least_4x_smaller() { local a b; a="$(pack_kib "$1")" && b="$(pack_kib "$2")" && [[ -n "$a" && -n "$b" ]] && (( a * 4 < b )); }
+same_rev() { local a b; a="$(git -C "$1" rev-parse --verify -q "$2")" && b="$(git -C "$3" rev-parse --verify -q "$4")" && [[ "$a" == "$b" ]]; }
+tracked() { local s; s="$(git -C "$1" ls-files -- "$2")" || return 1; [[ -n "$s" ]]; }
+untracked() { local s; s="$(git -C "$1" ls-files -- "$2")" || return 1; [[ -z "$s" ]]; }
+clean_worktree() { local s; s="$(git -C "$1" status --porcelain)" || return 1; [[ -z "$s" ]]; }
+no_blob_at_least() {
+  local s
+  s="$(git -C "$1" cat-file --batch-all-objects --batch-check='%(objecttype) %(objectsize)')" || return 1
+  ! awk -v min="$2" '$1 == "blob" && $2 >= min { found = 1 } END { exit !found }' <<< "$s"
+}
 
 # ---------------------------------------------------------------------------------------------
 # Fixture: a remote with large files under uploads/ and a vmlinuz file, two branches, an
@@ -125,11 +175,8 @@ fi
 echo "# rewrite + verify"
 printf '# comment\r\n\r\n./uploads/\r\n/vmlinuz\r\n' > "$SANDBOX/paths.txt"
 WD1="$SANDBOX/wd1"
-if run_tool "$SANDBOX/rewrite1.log" rewrite --url "$URL" --workdir "$WD1" --paths-file "$SANDBOX/paths.txt"; then
-  ok "rewrite succeeds (paths file with CRLF, comments, ./ and / prefixes)"
-else
-  ko "rewrite succeeds"; cat "$SANDBOX/rewrite1.log"
-fi
+setup_step "$SANDBOX/rewrite1.log" rewrite --url "$URL" --workdir "$WD1" --paths-file "$SANDBOX/paths.txt"
+ok "rewrite succeeds (paths file with CRLF, comments, ./ and / prefixes)"
 check "paths normalized" bash -c "[[ \"\$(cat '$WD1/paths.txt')\" == \$'uploads\nvmlinuz' ]]"
 check "verified.ok written" test -f "$WD1/verified.ok"
 check "refs/notes/commits dropped and reported" contains "$WD1/dropped-refs.txt" "refs/notes/commits"
@@ -138,11 +185,9 @@ check "no vmlinuz left in rewritten history" no_history_path_prefix "$WD1/work.g
 check "uploads2/keep.bin kept (prefix boundary)" has_history_path "$WD1/work.git" "uploads2/keep.bin"
 check "uploads.txt kept" has_history_path "$WD1/work.git" "uploads.txt"
 check "nested 'dir with space/uploads/x.txt' kept" has_history_path "$WD1/work.git" "dir with space/uploads/x.txt"
-check "all 4 refs exist after rewrite" bash -c "[[ \$(git -C '$WD1/work.git' for-each-ref refs/heads refs/tags | wc -l) -eq 4 ]]"
-check "commit that only touched uploads is dropped" bash -c "! git -C '$WD1/work.git' log --all --format=%s | grep -qx 'c5 only uploads'"
-check "rewritten repository is smaller than the backup" bash -c "
-  s() { git -C \"\$1\" count-objects -v | awk '\$1==\"size-pack:\"{print \$2}'; }
-  (( \$(s '$WD1/work.git') * 4 < \$(s '$WD1/backup.git') ))"
+check "all 4 refs exist after rewrite" ref_count_is "$WD1/work.git" 4
+check "commit that only touched uploads is dropped" commit_subject_absent "$WD1/work.git" "c5 only uploads"
+check "rewritten repository is at least 4x smaller than the backup" at_least_4x_smaller "$WD1/work.git" "$WD1/backup.git"
 check "commit-map available for server-side cleanup" test -s "$WD1/work.git/filter-repo/commit-map"
 check "backup.git untouched (still contains uploads/)" has_history_path "$WD1/backup.git" "uploads/images/a.jpg"
 
@@ -154,11 +199,11 @@ fi
 
 # Corrupt the rewritten repository behind the tool's back: verify must catch it.
 WD_BAD="$SANDBOX/wd-corrupt"
-run_tool "$SANDBOX/rewrite-bad.log" rewrite --url "$URL" --workdir "$WD_BAD" --path uploads --path vmlinuz
-(
-  cd "$SANDBOX" && git clone -q "$WD_BAD/work.git" corrupt-src 2>/dev/null && cd corrupt-src
-  echo "tampered" >> README.md && git commit -qam "tamper" && git push -q origin master 2>/dev/null
-)
+setup_step "$SANDBOX/rewrite-bad.log" rewrite --url "$URL" --workdir "$WD_BAD" --path uploads --path vmlinuz
+git clone -q "$WD_BAD/work.git" "$SANDBOX/corrupt-src" 2>/dev/null
+echo "tampered" >> "$SANDBOX/corrupt-src/README.md"
+git -C "$SANDBOX/corrupt-src" commit -qam "tamper"
+git -C "$SANDBOX/corrupt-src" push -q origin master 2>/dev/null
 if run_tool "$SANDBOX/verify-bad.log" verify --workdir "$WD_BAD"; then
   ko "verify detects a file changed outside the purged paths"
 else
@@ -178,7 +223,7 @@ if run_tool "$SANDBOX/upd-early.log" update-checkout --repo "$PROD" --path uploa
 else
   check "update-checkout refuses while the upstream is not rewritten" contains "$SANDBOX/upd-early.log" "still contains"
 fi
-check "prod index untouched after refusal" bash -c "[[ \$(git -C '$PROD' ls-files uploads | wc -l) -gt 0 ]]"
+check "prod index untouched after refusal" tracked "$PROD" uploads
 
 # ---------------------------------------------------------------------------------------------
 echo "# push: interactive confirmation and race detection"
@@ -200,8 +245,8 @@ check "remote untouched after refused push" bash -c "[[ \$(git -C '$REMOTE' rev-
 # ---------------------------------------------------------------------------------------------
 echo "# rewrite again and push"
 WD2="$SANDBOX/wd2"
-run_tool "$SANDBOX/rewrite2.log" rewrite --url "$URL" --workdir "$WD2" --path uploads --path vmlinuz \
-  && ok "second rewrite succeeds" || { ko "second rewrite succeeds"; cat "$SANDBOX/rewrite2.log"; }
+setup_step "$SANDBOX/rewrite2.log" rewrite --url "$URL" --workdir "$WD2" --path uploads --path vmlinuz
+ok "second rewrite succeeds"
 if run_tool "$SANDBOX/push2.log" push --workdir "$WD2" --yes; then
   ok "push succeeds"
 else
@@ -238,24 +283,24 @@ if run_tool "$SANDBOX/upd2.log" update-checkout --repo "$PROD2" --path uploads -
 else
   check "update-checkout refuses local changes outside purged paths" contains "$SANDBOX/upd2.log" "src/app.php"
 fi
-check "prod2 left untouched (uploads still tracked)" bash -c "[[ \$(git -C '$PROD2' ls-files uploads | wc -l) -gt 0 ]]"
+check "prod2 left untouched (uploads still tracked)" tracked "$PROD2" uploads
 
 if run_tool "$SANDBOX/upd.log" update-checkout --repo "$PROD" --paths-file "$WD2/paths.txt" --gc; then
   ok "update-checkout succeeds on prod"
 else
   ko "update-checkout succeeds on prod"; cat "$SANDBOX/upd.log"
 fi
-check "prod HEAD equals rewritten remote master" bash -c "[[ \$(git -C '$PROD' rev-parse HEAD) == \$(git -C '$REMOTE' rev-parse refs/heads/master) ]]"
+check "prod HEAD equals rewritten remote master" same_rev "$PROD" HEAD "$REMOTE" refs/heads/master
 check "prod-modified upload kept byte for byte" cmp -s "$PROD/uploads/images/a.jpg" "$SANDBOX/prod-a.jpg"
 check "untracked new upload kept" test -f "$PROD/uploads/images/new-upload.jpg"
 check "other uploads kept" test -f "$PROD/uploads/files/doc é.pdf"
-check "prod working copy clean" bash -c "[[ -z \$(git -C '$PROD' status --porcelain) ]]"
-check "prod no longer tracks uploads/" bash -c "[[ -z \$(git -C '$PROD' ls-files uploads) ]]"
-check "prod tag v1 updated to the rewritten tag" bash -c "[[ \$(git -C '$PROD' rev-parse v1) == \$(git -C '$REMOTE' rev-parse v1) ]]"
-check "prod reports no stale ref" bash -c "! grep -q 'still point to the old history' '$SANDBOX/upd.log'"
-check "prod object store has no uploads/ left after --gc" bash -c "
-  ! git -C '$PROD' cat-file --batch-all-objects --batch-check='%(objecttype) %(objectsize)' | awk '\$1==\"blob\" && \$2>=150000' | grep -q ."
+check "prod working copy clean" clean_worktree "$PROD"
+check "prod no longer tracks uploads/" untracked "$PROD" uploads
+check "prod tag v1 updated to the rewritten tag" same_rev "$PROD" v1 "$REMOTE" v1
+check "prod reports no stale ref" not_contains "$SANDBOX/upd.log" "still point to the old history"
+# Every purged blob in the fixture is >= 150000 bytes, every kept blob is smaller.
+check "prod object store has no purged blob left after --gc" no_blob_at_least "$PROD" 150000
 
-echo
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
-(( FAIL == 0 ))
+summary
+FINISHED=1
+if (( FAIL > 0 )); then exit 1; fi
